@@ -25,11 +25,22 @@
     l.threshold.value = -4; l.knee.value = 0; l.ratio.value = 20; l.attack.value = 0.003; l.release.value = 0.15;
     l.connect(a.destination); return l;
   }
+  /* Si el navegador suspende el audio (autoplay, pestaña en segundo plano, interrupción), se avisa y se reanuda con el siguiente toque. */
+  function onCtxState() {
+    let tip = document.getElementById('audiotip');
+    if (ctx && ctx.state === 'running') { if (tip) tip.remove(); return; }
+    if (!SM._lastReq || tip || !document.body) return;
+    tip = document.createElement('div'); tip.id = 'audiotip';
+    tip.textContent = '🔇 Toca la pantalla para activar el sonido';
+    tip.style.cssText = 'position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:#000c;color:#ffd24a;border:1px solid #ffd24a88;border-radius:20px;padding:8px 16px;font:600 14px sans-serif;z-index:9998;pointer-events:none';
+    document.body.appendChild(tip);
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && ctx && ctx.state !== 'running') ac(); });
   function ac() {
     if (!ctx) {
-      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); master = ctx.createGain(); master.gain.value = 1.8; master.connect(limiter(ctx)); } catch (e) { return null; }
+      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); master = ctx.createGain(); master.gain.value = 1.8; master.connect(limiter(ctx)); ctx.onstatechange = onCtxState; } catch (e) { return null; }
     }
-    if (ctx.state === 'suspended') ctx.resume();
+    if (ctx.state !== 'running') { try { const r = ctx.resume(); if (r && r.catch) r.catch(() => {}); } catch (e) {} }
     return ctx;
   }
   function tone(f0, f1, dur, type, vol, delay) {
@@ -94,11 +105,29 @@
       default: return { list: ['explore'], random: false };
     }
   }
-  /* Reproductor con bucle suave: antes de que acabe la pista, la misma pista vuelve a entrar
-     con un fundido cruzado (saltando la introducción), así no hay cortes ni silencios. */
+  /* Música en streaming: cada pista es un <audio> (el navegador la descarga y decodifica poco a poco, sin cargar
+     la canción entera en memoria) conectado al reloj de Web Audio para subir el volumen con un limitador.
+     Antes de que acabe la pista, la misma pista vuelve a entrar con un fundido cruzado (saltando la introducción). */
   const XF = 7;                 // segundos de fundido cruzado
-  const players = []; SM._players = players;           // { a, vol, goal, rate, name, kind, looped }
-  let ticker = null, lastTick = 0;
+  const players = []; SM._players = players;           // { a, g, vol, goal, rate, name }
+  let ticker = null, lastTick = 0, bus = null;
+  const musicLevel = () => SM.settings.music * 2.5;
+  function waBus() {
+    const a = ac(); if (!a) return null;
+    if (!bus) { bus = a.createGain(); bus.connect(limiter(a)); }
+    bus.gain.value = musicLevel();
+    return bus;
+  }
+  const trackGain = (name) => Math.max(0.5, Math.min(4, (root.SM_GAINS && root.SM_GAINS[name]) || 1));
+  function applyVol(p) {
+    const v = Math.max(0, p.vol);
+    if (p.g) p.g.gain.value = v * trackGain(p.name);
+    else p.a.volume = Math.max(0, Math.min(1, v * SM.settings.music));
+  }
+  function killPlayer(p) {
+    try { p.a.pause(); p.a.removeAttribute('src'); p.a.load(); } catch (e) {}
+    try { if (p.src) p.src.disconnect(); if (p.g) p.g.disconnect(); } catch (e) {}
+  }
   function startTicker() {
     if (ticker) return;
     ticker = setInterval(() => {
@@ -108,13 +137,12 @@
         const p = players[i];
         if (p.vol < p.goal) p.vol = Math.min(p.goal, p.vol + p.rate * dt);
         else if (p.vol > p.goal) p.vol = Math.max(p.goal, p.vol - p.rate * dt);
-        p.a.volume = Math.max(0, Math.min(1, p.vol * SM.settings.music));
-        if (p.goal === 0 && p.vol <= 0.001) { try { p.a.pause(); } catch (e) {} players.splice(i, 1); continue; }
-        // ¿se acerca el final de la pista que suena? entra la siguiente vuelta
+        applyVol(p);
+        if (p.goal === 0 && p.vol <= 0.001) { killPlayer(p); players.splice(i, 1); continue; }
         const d = p.a.duration;
         if (p.goal > 0 && !p.next && isFinite(d) && d > XF * 2.5 && d - p.a.currentTime <= XF) {
           p.next = true;
-          const start = Math.min(d * 0.1, 14);       // se salta la introducción en las vueltas siguientes
+          const start = Math.min(d * 0.1, 14);
           spawn(p.name, XF, start, [p]);
         }
       }
@@ -123,80 +151,22 @@
   }
   function spawn(name, fadeSecs, startAt, outgoing) {
     const a = new Audio(SM.asset('music/' + name + '.' + SM.musicExt));
-    a.loop = false; a.volume = 0;
+    a.loop = false; a.preload = 'auto';
     const p = { a, vol: 0, goal: 1, rate: 1 / fadeSecs, name };
     const out = outgoing || [];
+    const b = waBus();
+    if (b) {
+      try { p.src = ctx.createMediaElementSource(a); p.g = ctx.createGain(); p.g.gain.value = 0; p.src.connect(p.g); p.g.connect(b); a.volume = 1; }
+      catch (e) { p.src = p.g = null; a.volume = 0; }
+    } else a.volume = 0;
     out.forEach((o) => { o.next = true; });
     a.addEventListener('playing', () => { out.forEach((o) => { o.goal = 0; o.rate = 1 / Math.max(fadeSecs, 0.5); }); }, { once: true });
     a.addEventListener('loadedmetadata', () => { if (startAt) { try { a.currentTime = startAt; } catch (e) {} } });
     a.addEventListener('ended', () => { if (players.includes(p) && p.goal > 0 && !p.next) { p.next = true; spawn(name, 0.5, 0, [p]); } });
-    const pr = a.play(); if (pr && pr.catch) pr.catch((err) => { if (p.goal <= 0 || (err && err.name === 'AbortError')) return; SM._pendingMusic = SM._lastReq; curName = ''; players.splice(players.indexOf(p), 1); });
+    a.addEventListener('error', () => { if (players.includes(p) && p.goal > 0) { out.forEach((o) => { o.goal = 0; }); curName = ''; } });
+    const pr = a.play(); if (pr && pr.catch) pr.catch((err) => { if (p.goal <= 0 || (err && err.name === 'AbortError')) return; SM._pendingMusic = SM._lastReq; curName = ''; const k = players.indexOf(p); if (k >= 0) players.splice(k, 1); killPlayer(p); onCtxState(); });
     players.push(p); startTicker();
     return p;
-  }
-
-  /* ---------- Música con Web Audio ----------
-     Todo se programa en el reloj del audio (no en timers, que el navegador frena en segundo plano),
-     cada pista se normaliza a un volumen común y un limitador deja subir el volumen sin saturar. */
-  const wa = { bus: null, track: null, token: 0, broken: false, cache: new Map() };
-  const musicLevel = () => SM.settings.music * 2.5;
-  function waBus() {
-    const a = ac(); if (!a) return null;
-    if (!wa.bus) { wa.bus = a.createGain(); wa.bus.connect(limiter(a)); }
-    wa.bus.gain.value = musicLevel();
-    return wa.bus;
-  }
-  function waLoad(name) {
-    if (wa.cache.has(name)) return wa.cache.get(name);
-    const a = ac();
-    const pr = fetch(SM.asset('music/' + name + '.' + SM.musicExt)).then((r) => { if (!r.ok && r.status) throw new Error('http'); return r.arrayBuffer(); })
-      .then((ab) => new Promise((res, rej) => { const q = a.decodeAudioData(ab, res, rej); if (q && q.catch) q.catch(rej); }))
-      .then((buf) => {
-        const d = buf.getChannelData(0); let sum = 0, n = 0;
-        for (let i = 0; i < d.length; i += 7) { sum += d[i] * d[i]; n++; }
-        const rms = Math.sqrt(sum / Math.max(1, n)) || 0.1;
-        return { buf, gain: Math.max(0.5, Math.min(4, 0.14 / rms)) };      // objetivo ≈ -17 dBFS RMS
-      });
-    wa.cache.set(name, pr);
-    pr.catch(() => wa.cache.delete(name));
-    while (wa.cache.size > 3) { const k = wa.cache.keys().next().value; if (k === wa.track?.name) break; wa.cache.delete(k); }
-    return pr;
-  }
-  function waVoice(tr, when, offset, fade) {
-    const a = ctx, buf = tr.info.buf, gn = tr.info.gain;
-    const s = a.createBufferSource(), g = a.createGain();
-    s.buffer = buf; s.connect(g); g.connect(wa.bus);
-    const endT = when + (buf.duration - offset);
-    g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(gn, when + fade);
-    g.gain.setValueAtTime(gn, endT - XF); g.gain.linearRampToValueAtTime(0, endT);
-    s.start(when, offset); s.stop(endT + 0.1);
-    tr.voices.push({ s, g });
-    if (tr.voices.length > 6) tr.voices.shift();
-    tr.nextStart = endT - XF;               // la siguiente vuelta entra mientras esta se apaga
-  }
-  function waPump(tr) {
-    if (tr.dead || !ctx) return;
-    const skip = Math.min(tr.info.buf.duration * 0.1, 14);
-    while (tr.nextStart - ctx.currentTime < 40) waVoice(tr, tr.nextStart, skip, XF);
-  }
-  function waStop(tr, fade) {
-    tr.dead = true;
-    const now = ctx.currentTime;
-    tr.voices.forEach(({ s, g }) => {
-      try { const v = g.gain.value; g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(v, now); g.gain.linearRampToValueAtTime(0, now + fade); s.stop(now + fade + 0.1); } catch (e) {}
-    });
-  }
-  setInterval(() => { if (wa.track && !wa.track.dead) waPump(wa.track); }, 1000);
-  function waPlay(name, fade, token) {
-    return waLoad(name).then((info) => {
-      if (token !== wa.token) return;       // mientras cargaba se pidió otra pista
-      if (!waBus()) throw new Error('noctx');
-      if (wa.track) waStop(wa.track, fade);
-      const tr = { name, info, voices: [], nextStart: 0, dead: false };
-      wa.track = tr;
-      waVoice(tr, ctx.currentTime + 0.05, 0, fade);
-      waPump(tr);
-    });
   }
   SM.music = function (kind, act, extra) {
     const c = candidates(kind, act, extra);
@@ -211,12 +181,14 @@
     } else name = avail[0];
     if (name === curName) return;
     SM._lastTrack = curName; curName = name;
-    if (!wa.broken && ac() && typeof fetch === 'function') {
-      const tok = ++wa.token;
-      players.forEach((p) => { p.goal = 0; p.rate = 1 / 1.8; });
-      waPlay(name, 1.8, tok).catch(() => { wa.broken = true; if (tok === wa.token) spawn(name, 1.8, 0, players.slice()); });
-    } else spawn(name, 1.8, 0, players.slice());   // respaldo: <audio>
+    const old = players.filter((p) => p.goal > 0);
+    old.forEach((p) => { p.goal = 0; p.rate = 1 / 1.8; p.next = true; });
+    spawn(name, 1.8, 0, []);
   };
-  SM.applyMusicVolume = () => { if (wa.bus) wa.bus.gain.value = musicLevel(); for (const p of players) p.a.volume = Math.max(0, Math.min(1, p.vol * SM.settings.music)); };
-  SM.unlockAudio = () => { ac(); if (SM._pendingMusic) { const [k, a, x] = SM._pendingMusic; SM._pendingMusic = null; SM.music(k, a, x); } };
+  SM.applyMusicVolume = () => { if (bus) bus.gain.value = musicLevel(); for (const p of players) applyVol(p); };
+  SM.unlockAudio = () => {
+    ac();
+    for (const p of players) if (p.goal > 0 && p.a.paused) { const r = p.a.play(); if (r && r.catch) r.catch(() => {}); }
+    if (SM._pendingMusic) { const [k, a, x] = SM._pendingMusic; SM._pendingMusic = null; SM.music(k, a, x); }
+  };
 })();

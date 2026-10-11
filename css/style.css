@@ -391,3 +391,6 @@ button { font-family: inherit; color: inherit; cursor: pointer; }
 #rotate { display: none; position: fixed; inset: 0; z-index: 99999; background: #0c0a12; color: var(--gold); text-align: center; align-items: center; justify-content: center; font-size: 22px; padding: 24px; }
 #rotate div { font-size: 64px; } #rotate p { font-size: 20px; margin: 12px 0 0; }
 @media (orientation: portrait) and (max-width: 900px) { #rotate { display: flex; } }
+
+/* El cursor del sistema siempre visible (Firefox/Chrome lo ocultan a veces en pantalla completa o con la página ocupada) */
+html, body, #viewport, #stage { cursor: default; }
