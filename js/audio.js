@@ -20,9 +20,14 @@
 
   /* ---------- Efectos ---------- */
   let ctx = null, master = null;
+  function limiter(a) {   // evita saturar al subir el volumen
+    const l = a.createDynamicsCompressor();
+    l.threshold.value = -4; l.knee.value = 0; l.ratio.value = 20; l.attack.value = 0.003; l.release.value = 0.15;
+    l.connect(a.destination); return l;
+  }
   function ac() {
     if (!ctx) {
-      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); master = ctx.createGain(); master.connect(ctx.destination); } catch (e) { return null; }
+      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); master = ctx.createGain(); master.gain.value = 1.8; master.connect(limiter(ctx)); } catch (e) { return null; }
     }
     if (ctx.state === 'suspended') ctx.resume();
     return ctx;
@@ -93,11 +98,12 @@
      con un fundido cruzado (saltando la introducción), así no hay cortes ni silencios. */
   const XF = 7;                 // segundos de fundido cruzado
   const players = []; SM._players = players;           // { a, vol, goal, rate, name, kind, looped }
-  let ticker = null;
+  let ticker = null, lastTick = 0;
   function startTicker() {
     if (ticker) return;
     ticker = setInterval(() => {
-      const dt = 0.05;
+      if (!ticker) return;
+      const now = performance.now(), dt = Math.min(1, (now - (lastTick || now)) / 1000 || 0.05); lastTick = now;
       for (let i = players.length - 1; i >= 0; i--) {
         const p = players[i];
         if (p.vol < p.goal) p.vol = Math.min(p.goal, p.vol + p.rate * dt);
@@ -109,22 +115,88 @@
         if (p.goal > 0 && !p.next && isFinite(d) && d > XF * 2.5 && d - p.a.currentTime <= XF) {
           p.next = true;
           const start = Math.min(d * 0.1, 14);       // se salta la introducción en las vueltas siguientes
-          spawn(p.name, XF, start, p);
-          p.goal = 0; p.rate = 1 / XF;
+          spawn(p.name, XF, start, [p]);
         }
       }
-      if (!players.length) { clearInterval(ticker); ticker = null; }
+      if (!players.length) { clearInterval(ticker); ticker = null; lastTick = 0; }
     }, 50);
   }
-  function spawn(name, fadeSecs, startAt, from) {
+  function spawn(name, fadeSecs, startAt, outgoing) {
     const a = new Audio(SM.asset('music/' + name + '.' + SM.musicExt));
     a.loop = false; a.volume = 0;
     const p = { a, vol: 0, goal: 1, rate: 1 / fadeSecs, name };
+    const out = outgoing || [];
+    out.forEach((o) => { o.next = true; });
+    a.addEventListener('playing', () => { out.forEach((o) => { o.goal = 0; o.rate = 1 / Math.max(fadeSecs, 0.5); }); }, { once: true });
     a.addEventListener('loadedmetadata', () => { if (startAt) { try { a.currentTime = startAt; } catch (e) {} } });
-    a.addEventListener('ended', () => { if (players.includes(p) && p.goal > 0 && !p.next) { p.next = true; spawn(name, 0.5, 0, p); } });
-    const pr = a.play(); if (pr && pr.catch) pr.catch(() => { SM._pendingMusic = SM._lastReq; curName = ''; players.splice(players.indexOf(p), 1); });
+    a.addEventListener('ended', () => { if (players.includes(p) && p.goal > 0 && !p.next) { p.next = true; spawn(name, 0.5, 0, [p]); } });
+    const pr = a.play(); if (pr && pr.catch) pr.catch((err) => { if (p.goal <= 0 || (err && err.name === 'AbortError')) return; SM._pendingMusic = SM._lastReq; curName = ''; players.splice(players.indexOf(p), 1); });
     players.push(p); startTicker();
     return p;
+  }
+
+  /* ---------- Música con Web Audio ----------
+     Todo se programa en el reloj del audio (no en timers, que el navegador frena en segundo plano),
+     cada pista se normaliza a un volumen común y un limitador deja subir el volumen sin saturar. */
+  const wa = { bus: null, track: null, token: 0, broken: false, cache: new Map() };
+  const musicLevel = () => SM.settings.music * 2.5;
+  function waBus() {
+    const a = ac(); if (!a) return null;
+    if (!wa.bus) { wa.bus = a.createGain(); wa.bus.connect(limiter(a)); }
+    wa.bus.gain.value = musicLevel();
+    return wa.bus;
+  }
+  function waLoad(name) {
+    if (wa.cache.has(name)) return wa.cache.get(name);
+    const a = ac();
+    const pr = fetch(SM.asset('music/' + name + '.' + SM.musicExt)).then((r) => { if (!r.ok && r.status) throw new Error('http'); return r.arrayBuffer(); })
+      .then((ab) => new Promise((res, rej) => { const q = a.decodeAudioData(ab, res, rej); if (q && q.catch) q.catch(rej); }))
+      .then((buf) => {
+        const d = buf.getChannelData(0); let sum = 0, n = 0;
+        for (let i = 0; i < d.length; i += 7) { sum += d[i] * d[i]; n++; }
+        const rms = Math.sqrt(sum / Math.max(1, n)) || 0.1;
+        return { buf, gain: Math.max(0.5, Math.min(4, 0.14 / rms)) };      // objetivo ≈ -17 dBFS RMS
+      });
+    wa.cache.set(name, pr);
+    pr.catch(() => wa.cache.delete(name));
+    while (wa.cache.size > 3) { const k = wa.cache.keys().next().value; if (k === wa.track?.name) break; wa.cache.delete(k); }
+    return pr;
+  }
+  function waVoice(tr, when, offset, fade) {
+    const a = ctx, buf = tr.info.buf, gn = tr.info.gain;
+    const s = a.createBufferSource(), g = a.createGain();
+    s.buffer = buf; s.connect(g); g.connect(wa.bus);
+    const endT = when + (buf.duration - offset);
+    g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(gn, when + fade);
+    g.gain.setValueAtTime(gn, endT - XF); g.gain.linearRampToValueAtTime(0, endT);
+    s.start(when, offset); s.stop(endT + 0.1);
+    tr.voices.push({ s, g });
+    if (tr.voices.length > 6) tr.voices.shift();
+    tr.nextStart = endT - XF;               // la siguiente vuelta entra mientras esta se apaga
+  }
+  function waPump(tr) {
+    if (tr.dead || !ctx) return;
+    const skip = Math.min(tr.info.buf.duration * 0.1, 14);
+    while (tr.nextStart - ctx.currentTime < 40) waVoice(tr, tr.nextStart, skip, XF);
+  }
+  function waStop(tr, fade) {
+    tr.dead = true;
+    const now = ctx.currentTime;
+    tr.voices.forEach(({ s, g }) => {
+      try { const v = g.gain.value; g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(v, now); g.gain.linearRampToValueAtTime(0, now + fade); s.stop(now + fade + 0.1); } catch (e) {}
+    });
+  }
+  setInterval(() => { if (wa.track && !wa.track.dead) waPump(wa.track); }, 1000);
+  function waPlay(name, fade, token) {
+    return waLoad(name).then((info) => {
+      if (token !== wa.token) return;       // mientras cargaba se pidió otra pista
+      if (!waBus()) throw new Error('noctx');
+      if (wa.track) waStop(wa.track, fade);
+      const tr = { name, info, voices: [], nextStart: 0, dead: false };
+      wa.track = tr;
+      waVoice(tr, ctx.currentTime + 0.05, 0, fade);
+      waPump(tr);
+    });
   }
   SM.music = function (kind, act, extra) {
     const c = candidates(kind, act, extra);
@@ -139,9 +211,12 @@
     } else name = avail[0];
     if (name === curName) return;
     SM._lastTrack = curName; curName = name;
-    for (const p of players) { p.goal = 0; p.rate = 1 / 1.6; p.next = true; }   // lo anterior se desvanece
-    spawn(name, 1.8, 0);
+    if (!wa.broken && ac() && typeof fetch === 'function') {
+      const tok = ++wa.token;
+      players.forEach((p) => { p.goal = 0; p.rate = 1 / 1.8; });
+      waPlay(name, 1.8, tok).catch(() => { wa.broken = true; if (tok === wa.token) spawn(name, 1.8, 0, players.slice()); });
+    } else spawn(name, 1.8, 0, players.slice());   // respaldo: <audio>
   };
-  SM.applyMusicVolume = () => { for (const p of players) p.a.volume = Math.max(0, Math.min(1, p.vol * SM.settings.music)); };
+  SM.applyMusicVolume = () => { if (wa.bus) wa.bus.gain.value = musicLevel(); for (const p of players) p.a.volume = Math.max(0, Math.min(1, p.vol * SM.settings.music)); };
   SM.unlockAudio = () => { ac(); if (SM._pendingMusic) { const [k, a, x] = SM._pendingMusic; SM._pendingMusic = null; SM.music(k, a, x); } };
 })();

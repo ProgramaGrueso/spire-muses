@@ -394,6 +394,7 @@
   }
   function renderHand() {
     const C = Cb.C, hand = $('#hand'); hand.innerHTML = '';
+    if (Cb.selUid && !C.hand.some((c) => c.uid === Cb.selUid)) { Cb.selUid = null; Cb.pending = null; }
     const n = C.hand.length, cw = 168;
     const step = n > 1 ? Math.min(cw - 6, (970 - cw) / (n - 1)) : 0;
     C.hand.forEach((inst, i) => {
@@ -407,6 +408,7 @@
       if (d.cost !== 'X' && d.cost > C.energy && d.cost >= 0) el.classList.add('unaff');
       if (!Cb.seen.has(inst.uid)) { el.classList.add('draw-in'); el.style.setProperty('--d', (i * 0.06) + 's'); Cb.seen.add(inst.uid); }
       if (Cb.selUid === inst.uid) el.classList.add('sel');
+      el.addEventListener('animationend', () => el.classList.remove('draw-in'));
       el.onclick = (ev) => { ev.stopPropagation(); onCardClick(inst); };
       el.oncontextmenu = (ev) => { ev.preventDefault(); cancelSel(); };
       hand.appendChild(el);
